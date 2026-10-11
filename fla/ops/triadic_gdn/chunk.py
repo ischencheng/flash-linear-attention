@@ -32,11 +32,12 @@ class ChunkTriadicGDNFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
+        disable_recompute: bool = False,
         chunk_size: int = 64,
     ):
         if cu_seqlens is not None and chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-        g, Ai, Aqk, o, final_state = chunk_triadic_gdn_fwd(
+        g, Ai, Aqk, h, v_new, o, final_state = chunk_triadic_gdn_fwd(
             q=q,
             k=k,
             v=v,
@@ -50,8 +51,9 @@ class ChunkTriadicGDNFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_size=chunk_size,
+            save_states=disable_recompute,
         )
-        ctx.save_for_backward(q, k, v, k2, q2, g, beta, Ai, Aqk, initial_state, cu_seqlens, chunk_indices)
+        ctx.save_for_backward(q, k, v, k2, q2, g, beta, Ai, Aqk, h, v_new, initial_state, cu_seqlens, chunk_indices)
         ctx.scale = scale
         ctx.chunk_size = chunk_size
         return o, final_state
@@ -60,7 +62,7 @@ class ChunkTriadicGDNFunction(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor | None):
-        q, k, v, k2, q2, g, beta, Ai, Aqk, initial_state, cu_seqlens, chunk_indices = ctx.saved_tensors
+        q, k, v, k2, q2, g, beta, Ai, Aqk, h, v_new, initial_state, cu_seqlens, chunk_indices = ctx.saved_tensors
         dq, dk, dv, dk2, dq2, dg, dbeta, dh0 = chunk_triadic_gdn_bwd(
             q=q,
             k=k,
@@ -75,13 +77,15 @@ class ChunkTriadicGDNFunction(torch.autograd.Function):
             initial_state=initial_state,
             do=do,
             dht=dht,
+            h=h,
+            u=v_new,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_size=ctx.chunk_size,
         )
         return (
             dq.to(q), dk.to(k), dv.to(v), dk2.to(k2), dq2.to(q2), dg.to(g), dbeta.to(beta),
-            None, dh0, None, None, None, None,
+            None, dh0, None, None, None, None, None,
         )
 
 
@@ -99,6 +103,7 @@ def chunk_triadic_gdn(
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    disable_recompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Triadic Gated DeltaNet (https://arxiv.org/abs/2609.36529) in chunkwise-parallel form, for training and prefill.
@@ -138,6 +143,9 @@ def chunk_triadic_gdn(
             consistent with the FlashAttention API. Default: `None`.
         chunk_indices (torch.LongTensor, Optional):
             Chunk indices precomputed from `cu_seqlens`. Default: `None`.
+        disable_recompute (bool, Optional):
+            Whether to save the chunk states of the forward pass instead of recomputing them in the backward pass,
+            which is faster at the cost of `E * K * V` values per chunk and head. Default: `False`.
 
     Returns:
         o (torch.Tensor):
@@ -157,8 +165,8 @@ def chunk_triadic_gdn(
         )
     if beta.shape != (B, T, H):
         raise ValueError(f"beta must have shape [B, T, H]={[B, T, H]}, got {list(beta.shape)}.")
-    if K > 256:
-        raise ValueError(f"chunk_triadic_gdn supports key head dims up to 256, got {K}.")
+    if K > 256 or v.shape[-1] > 256:
+        raise ValueError(f"chunk_triadic_gdn supports head dims up to 256, got K={K} and V={v.shape[-1]}.")
     if cu_seqlens is not None:
         if B != 1:
             raise ValueError(
@@ -173,5 +181,5 @@ def chunk_triadic_gdn(
     if scale is None:
         scale = K ** -0.5
     return ChunkTriadicGDNFunction.apply(
-        q, k, v, k2, q2, g, beta, scale, initial_state, output_final_state, cu_seqlens, chunk_indices,
+        q, k, v, k2, q2, g, beta, scale, initial_state, output_final_state, cu_seqlens, chunk_indices, disable_recompute,
     )

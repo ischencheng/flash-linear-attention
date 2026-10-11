@@ -195,17 +195,20 @@ def test_fused_recurrent_varlen(H: int, K: int, V: int, E: int, cu_seqlens: list
 
 
 @pytest.mark.parametrize(
-    ('B', 'T', 'H', 'K', 'V', 'E', 'scale', 'gate_logit_normalizer', 'dtype'),
+    ('B', 'T', 'H', 'K', 'V', 'E', 'scale', 'gate_logit_normalizer', 'disable_recompute', 'dtype'),
     [
-        pytest.param(*test, id="B{}-T{}-H{}-K{}-V{}-E{}-scale{}-gate_logit_normalizer{}-{}".format(*test))
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-K{}-V{}-E{}-scale{}-gate_logit_normalizer{}-disable_recompute{}-{}".format(*test),
+        )
         for test in [
-            (1, 63, 1, 64, 64, 1, 1, 1, torch.float16),
-            (2, 500, 3, 60, 64, 2, 1, 1, torch.float16),
-            (2, 1000, 2, 128, 128, 4, 0.1, 0.1, torch.bfloat16),
-            (2, 1024, 2, 128, 128, 8, 1, 1, torch.bfloat16),
-            (1, 777, 2, 100, 96, 12, 1, 10, torch.float16),
-            (1, 256, 2, 128, 128, 16, 1, 1, torch.bfloat16),
-            (1, 300, 2, 256, 128, 4, 1, 1, torch.bfloat16),
+            (1, 63, 1, 64, 64, 1, 1, 1, False, torch.float16),
+            (2, 500, 3, 60, 64, 2, 1, 1, True, torch.float16),
+            (2, 1000, 2, 128, 128, 4, 0.1, 0.1, False, torch.bfloat16),
+            (2, 1024, 2, 128, 128, 8, 1, 1, True, torch.bfloat16),
+            (1, 777, 2, 100, 96, 12, 1, 10, False, torch.float16),
+            (1, 256, 2, 128, 128, 16, 1, 1, False, torch.bfloat16),
+            (1, 300, 2, 256, 128, 4, 1, 1, False, torch.bfloat16),
         ]
     ],
 )
@@ -218,6 +221,7 @@ def test_chunk(
     E: int,
     scale: float,
     gate_logit_normalizer: float,
+    disable_recompute: bool,
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
@@ -254,6 +258,7 @@ def test_chunk(
         scale=scale,
         initial_state=h0,
         output_final_state=True,
+        disable_recompute=disable_recompute,
     )
     ((tri * do).sum() + (tri_ht * dht).sum()).backward()
     tri_grads = [x.grad for x in (q, k, v, k2, q2, g, beta, h0)]

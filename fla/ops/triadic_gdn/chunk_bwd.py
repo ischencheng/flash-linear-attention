@@ -484,6 +484,8 @@ def chunk_triadic_gdn_bwd(
     initial_state: torch.Tensor | None,
     do: torch.Tensor,
     dht: torch.Tensor | None,
+    h: torch.Tensor | None = None,
+    u: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
@@ -494,19 +496,20 @@ def chunk_triadic_gdn_bwd(
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:
         N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
-    _, h, u, _ = chunk_triadic_gdn_fwd_h(
-        k=k,
-        v=v,
-        k2=k2,
-        g=g,
-        beta=beta,
-        Ai=Ai,
-        initial_state=initial_state,
-        save_states=True,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_size=chunk_size,
-    )
+    if h is None:
+        _, h, u, _ = chunk_triadic_gdn_fwd_h(
+            k=k,
+            v=v,
+            k2=k2,
+            g=g,
+            beta=beta,
+            Ai=Ai,
+            initial_state=initial_state,
+            save_states=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+        )
 
     BV, num_warps = get_state_block_size(K, E)
     dh = torch.empty_like(h)

@@ -53,24 +53,30 @@ def chunk_triadic_gdn_fwd_kernel_intra(
     p_A = (bos + o_t[:, None]) * H*BT + i_h * BT + o_i[None, :]
     p_e = (bos + o_t) * H*E + i_h * E
 
-    # A = beta * (k @ k^T) * R, strictly lower, with R[i, j] = sum_e k2[i, e] * k2[j, e] * exp(g[i, e] - g[j, e])
+    # R[i, j] = sum_e k2[i, e] * k2[j, e] * exp(g[i, e] - g[j, e]) and Rq[i, j] = sum_e q2[i, e] * k2[j, e] * exp(...)
+    # for j <= i; gate differences are formed before exp so that no factor can overflow
+    b_R = tl.zeros([BT, BT], dtype=tl.float32)
+    b_Rq = tl.zeros([BT, BT], dtype=tl.float32)
+    for i_e in range(E):
+        b_k2 = tl.load(k2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
+        b_q2 = tl.load(q2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
+        b_g = tl.load(g + p_e + i_e, mask=m_t, other=0).to(tl.float32)
+        b_d = tl.where(m_A, exp(tl.where(m_A, b_g[:, None] - b_g[None, :], 0)), 0)
+        b_R += b_k2[:, None] * b_k2[None, :] * b_d
+        b_Rq += b_q2[:, None] * b_k2[None, :] * b_d
+
+    # A = beta * (k @ k^T) * R, strictly lower
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         p_k = k + (bos + o_t[:, None]) * H*K + i_h * K + o_k[None, :]
         b_k = tl.load(p_k, mask=m_t[:, None] & (o_k < K)[None, :], other=0)
         b_A += tl.dot(b_k, tl.trans(b_k))
-    b_R = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_e in range(E):
-        b_k2 = tl.load(k2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_g = tl.load(g + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        # gate differences are formed before exp so that no factor can overflow
-        b_R += tl.where(m_A, b_k2[:, None] * b_k2[None, :] * exp(tl.where(m_A, b_g[:, None] - b_g[None, :], 0)), 0)
     b_beta = tl.load(beta + (bos + o_t) * H + i_h, mask=m_t, other=0).to(tl.float32)
     b_A = tl.where(o_i[:, None] > o_i[None, :], b_beta[:, None] * b_A * b_R, 0)
     tl.store(A + p_A, b_A.to(A.dtype.element_ty), mask=m_t[:, None])
 
-    # Aqk = scale * (q @ k^T) * Rq, lower, with Rq[i, j] = sum_e q2[i, e] * k2[j, e] * exp(g[i, e] - g[j, e])
+    # Aqk = scale * (q @ k^T) * Rq, lower
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
@@ -79,13 +85,7 @@ def chunk_triadic_gdn_fwd_kernel_intra(
         b_q = tl.load(p_q, mask=m_t[:, None] & (o_k < K)[None, :], other=0)
         b_k = tl.load(p_k, mask=m_t[:, None] & (o_k < K)[None, :], other=0)
         b_A += tl.dot(b_q, tl.trans(b_k))
-    b_R = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_e in range(E):
-        b_k2 = tl.load(k2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_q2 = tl.load(q2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_g = tl.load(g + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_R += tl.where(m_A, b_q2[:, None] * b_k2[None, :] * exp(tl.where(m_A, b_g[:, None] - b_g[None, :], 0)), 0)
-    b_A = b_A * b_R * scale
+    b_A = b_A * b_Rq * scale
     tl.store(Aqk + p_A, b_A.to(Aqk.dtype.element_ty), mask=m_t[:, None])
 
 
@@ -237,7 +237,8 @@ def chunk_triadic_gdn_fwd_intra(
     BT = chunk_size
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = k.new_empty(B, T, H, BT, dtype=torch.float32)
-    Aqk = torch.empty_like(A)
+    # consumed only as a bf16/fp16 tl.dot operand
+    Aqk = k.new_empty(B, T, H, BT)
     chunk_triadic_gdn_fwd_kernel_intra[(NT, B * H)](
         q=q,
         k=k,
@@ -350,6 +351,7 @@ def chunk_triadic_gdn_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    save_states: bool = False,
 ):
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
@@ -366,7 +368,7 @@ def chunk_triadic_gdn_fwd(
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
     )
-    o, _, _, final_state = chunk_triadic_gdn_fwd_h(
+    o, h, v_new, final_state = chunk_triadic_gdn_fwd_h(
         k=k,
         v=v,
         k2=k2,
@@ -379,8 +381,9 @@ def chunk_triadic_gdn_fwd(
         scale=scale,
         initial_state=initial_state,
         output_final_state=output_final_state,
+        save_states=save_states,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
     )
-    return g, Ai, Aqk, o, final_state
+    return g, Ai, Aqk, h, v_new, o, final_state
