@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.triadic_gdn.chunk_fwd import chunk_triadic_gdn_fwd_h, get_state_block_size
+from fla.ops.triadic_gdn.chunk_fwd import chunk_triadic_gdn_fwd_h, get_state_block_size, triadic_intra_r
 from fla.ops.utils import prepare_chunk_offsets
 from fla.ops.utils.op import exp
 
@@ -276,8 +276,10 @@ def chunk_triadic_gdn_bwd_kernel_intra(
     E: tl.constexpr,
     NK: tl.constexpr,
     BT: tl.constexpr,
+    BC: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     """
@@ -333,16 +335,7 @@ def chunk_triadic_gdn_bwd_kernel_intra(
         b_kk += tl.dot(b_k, tl.trans(b_k))
         b_qk += tl.dot(b_q, tl.trans(b_k))
 
-    # R and Rq of the forward pass
-    b_R = tl.zeros([BT, BT], dtype=tl.float32)
-    b_Rq = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_e in range(E):
-        b_k2 = tl.load(k2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_q2 = tl.load(q2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_g = tl.load(g + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_d = tl.where(m_A, exp(tl.where(m_A, b_g[:, None] - b_g[None, :], 0)), 0)
-        b_R += b_k2[:, None] * b_k2[None, :] * b_d
-        b_Rq += b_q2[:, None] * b_k2[None, :] * b_d
+    b_R, b_Rq = triadic_intra_r(k2, q2, g, bos, i_t, i_h, T, H, E, BT, BC, BE)
     b_dbeta += tl.sum(b_dA * b_kk * b_R, 1)
     # gradients of k_i . k_j and q_i . k_j
     b_dP = b_dA * b_beta[:, None] * b_R
@@ -620,8 +613,10 @@ def chunk_triadic_gdn_bwd(
         E=E,
         NK=NK,
         BT=BT,
+        BC=16,
         BK=BK,
         BV=min(64, triton.next_power_of_2(V)),
+        BE=max(16, triton.next_power_of_2(E)),
         num_warps=8,
         num_stages=1,
     )

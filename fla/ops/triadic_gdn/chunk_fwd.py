@@ -11,6 +11,77 @@ import triton.language as tl
 
 from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, prepare_chunk_offsets, solve_tril
 from fla.ops.utils.op import exp
+from fla.utils import IS_TF32_SUPPORTED
+
+# precision of the float32 products that build R, Rq and their gradients, as in the fused GDN kkt and solve kernel
+DOT_PRECISION = tl.constexpr('tf32' if IS_TF32_SUPPORTED else 'ieee')
+
+
+@triton.jit
+def triadic_intra_r(
+    k2,
+    q2,
+    g,
+    bos,
+    i_t,
+    i_h,
+    T,
+    H: tl.constexpr,
+    E: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BE: tl.constexpr,
+):
+    """
+    `R[i, j] = sum_e k2[i, e] * k2[j, e] * D_e[i, j]` and `Rq[i, j] = sum_e q2[i, e] * k2[j, e] * D_e[i, j]` for `j <= i`,
+    with `D_e[i, j] = exp(g[i, e] - g[j, e])`.
+
+    Between sub-chunks of `BC` rows, `D_e` factors exactly through the first row `r_c` of the later sub-chunk `c`:
+    `D_e[i, j] = exp(g[i, e] - g[r_c, e]) * exp(g[r_c, e] - g[j, e])`, where neither factor exceeds 1.
+    These blocks come from one product over columns `(c, e)`; diagonal sub-chunks are formed from gate differences.
+    """
+    o_i = tl.arange(0, BT)
+    o_c = tl.arange(0, BC)
+    o_n = tl.arange(0, BT // BC * BE)
+    o_nc, o_ne = o_n // BE, o_n % BE
+    m_t = i_t * BT + o_i < T
+    m_tn = m_t[:, None] & (o_ne < E)[None, :]
+    m_r = (i_t * BT + o_nc * BC < T) & (o_ne < E)
+    p_n = (bos + i_t * BT + o_i[:, None]) * H*E + i_h * E + o_ne[None, :]
+    # [BT, BT // BC * BE]
+    b_g = tl.load(g + p_n, mask=m_tn, other=0).to(tl.float32)
+    b_k2 = tl.load(k2 + p_n, mask=m_tn, other=0).to(tl.float32)
+    b_q2 = tl.load(q2 + p_n, mask=m_tn, other=0).to(tl.float32)
+    b_gr = tl.load(g + (bos + i_t * BT + o_nc * BC) * H*E + i_h * E + o_ne, mask=m_r, other=0).to(tl.float32)
+    # rows i of sub-chunk c, and rows j before it
+    m_a = m_tn & (o_nc[None, :] == (o_i // BC)[:, None])
+    m_b = m_tn & m_r[None, :] & (o_nc[None, :] > (o_i // BC)[:, None])
+    b_a = tl.where(m_a, exp(tl.where(m_a, b_g - b_gr[None, :], 0)), 0)
+    b_b = tl.where(m_b, b_k2 * exp(tl.where(m_b, b_gr[None, :] - b_g, 0)), 0)
+    b_R = tl.dot(b_k2 * b_a, tl.trans(b_b), input_precision=DOT_PRECISION)
+    b_Rq = tl.dot(b_q2 * b_a, tl.trans(b_b), input_precision=DOT_PRECISION)
+
+    # diagonal sub-chunks as [BT, BC] tiles, whose column c holds j = BC * (i // BC) + c
+    m_d = (o_c[None, :] <= (o_i % BC)[:, None]) & m_t[:, None]
+    p_i = (bos + i_t * BT + o_i) * H*E + i_h * E
+    p_j = (bos + i_t * BT + (o_i // BC * BC)[:, None] + o_c[None, :]) * H*E + i_h * E
+    b_Rd = tl.zeros([BT, BC], dtype=tl.float32)
+    b_Rqd = tl.zeros([BT, BC], dtype=tl.float32)
+    for i_e in range(E):
+        b_gi = tl.load(g + p_i + i_e, mask=m_t, other=0).to(tl.float32)
+        b_k2i = tl.load(k2 + p_i + i_e, mask=m_t, other=0).to(tl.float32)
+        b_q2i = tl.load(q2 + p_i + i_e, mask=m_t, other=0).to(tl.float32)
+        b_gj = tl.load(g + p_j + i_e, mask=m_d, other=0).to(tl.float32)
+        b_k2j = tl.load(k2 + p_j + i_e, mask=m_d, other=0).to(tl.float32)
+        b_d = tl.where(m_d, exp(tl.where(m_d, b_gi[:, None] - b_gj, 0)), 0)
+        b_Rd += b_k2i[:, None] * b_k2j * b_d
+        b_Rqd += b_q2i[:, None] * b_k2j * b_d
+    # scatter the diagonal tiles into place
+    b_place = tl.where(o_i[None, :] % BC == o_c[:, None], 1., 0.)
+    m_blk = (o_i // BC)[:, None] == (o_i // BC)[None, :]
+    b_R += tl.where(m_blk, tl.dot(b_Rd, b_place, input_precision=DOT_PRECISION), 0)
+    b_Rq += tl.where(m_blk, tl.dot(b_Rqd, b_place, input_precision=DOT_PRECISION), 0)
+    return b_R, b_Rq
 
 
 @triton.heuristics({
@@ -34,7 +105,9 @@ def chunk_triadic_gdn_fwd_kernel_intra(
     K: tl.constexpr,
     E: tl.constexpr,
     BT: tl.constexpr,
+    BC: tl.constexpr,
     BK: tl.constexpr,
+    BE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
@@ -49,21 +122,9 @@ def chunk_triadic_gdn_fwd_kernel_intra(
     o_i = tl.arange(0, BT)
     o_t = i_t * BT + o_i
     m_t = o_t < T
-    m_A = (o_i[:, None] >= o_i[None, :]) & m_t[:, None] & m_t[None, :]
     p_A = (bos + o_t[:, None]) * H*BT + i_h * BT + o_i[None, :]
-    p_e = (bos + o_t) * H*E + i_h * E
 
-    # R[i, j] = sum_e k2[i, e] * k2[j, e] * exp(g[i, e] - g[j, e]) and Rq[i, j] = sum_e q2[i, e] * k2[j, e] * exp(...)
-    # for j <= i; gate differences are formed before exp so that no factor can overflow
-    b_R = tl.zeros([BT, BT], dtype=tl.float32)
-    b_Rq = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_e in range(E):
-        b_k2 = tl.load(k2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_q2 = tl.load(q2 + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_g = tl.load(g + p_e + i_e, mask=m_t, other=0).to(tl.float32)
-        b_d = tl.where(m_A, exp(tl.where(m_A, b_g[:, None] - b_g[None, :], 0)), 0)
-        b_R += b_k2[:, None] * b_k2[None, :] * b_d
-        b_Rq += b_q2[:, None] * b_k2[None, :] * b_d
+    b_R, b_Rq = triadic_intra_r(k2, q2, g, bos, i_t, i_h, T, H, E, BT, BC, BE)
 
     # A = beta * (k @ k^T) * R, strictly lower
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
@@ -256,7 +317,9 @@ def chunk_triadic_gdn_fwd_intra(
         K=K,
         E=E,
         BT=BT,
+        BC=16,
         BK=min(64, triton.next_power_of_2(K)),
+        BE=max(16, triton.next_power_of_2(E)),
         num_warps=8,
         num_stages=1,
     )
