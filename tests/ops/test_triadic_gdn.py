@@ -276,39 +276,48 @@ def _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, initial_state, gk=None):
     return o, S
 
 
-def _make_factors(B, T, H, factors):
+def _make_factors(B, T, H, factors, gate_scale=1.0):
     k2s = [F.normalize(F.softplus(torch.randn(B, T, H, e, device=device)), p=2, dim=-1) for e in factors]
     q2s = [F.normalize(F.softplus(torch.randn(B, T, H, e, device=device)), p=2, dim=-1) for e in factors]
-    gs = [F.logsigmoid(torch.rand(B, T, H, e, device=device)) for e in factors]
+    gs = [F.logsigmoid(torch.rand(B, T, H, e, device=device)) * gate_scale for e in factors]
     return k2s, q2s, gs
 
 
 @pytest.mark.parametrize(
-    ('B', 'T', 'H', 'K', 'V', 'factors', 'dtype'),
+    ('B', 'T', 'H', 'K', 'V', 'factors', 'gate_scale', 'dtype'),
     [
-        pytest.param(*test, id="B{}-T{}-H{}-K{}-V{}-factors{}-{}".format(*test))
+        pytest.param(*test, id="B{}-T{}-H{}-K{}-V{}-factors{}-gate_scale{}-{}".format(*test))
         for test in [
-            (2, 100, 2, 32, 32, (2, 2), torch.float),
-            (1, 300, 2, 64, 64, (2, 3), torch.bfloat16),
-            (2, 200, 2, 64, 32, (2, 2, 2), torch.float16),
-            (1, 150, 2, 32, 32, (3, 2, 2), torch.bfloat16),
-            (1, 130, 2, 32, 32, (4,), torch.bfloat16),
+            (2, 100, 2, 32, 32, (2, 2), 1, torch.float),
+            (1, 300, 2, 64, 64, (2, 3), 1, torch.bfloat16),
+            (2, 200, 2, 64, 32, (2, 2, 2), 0.02, torch.float16),
+            (1, 150, 2, 32, 32, (3, 2, 2), 1, torch.bfloat16),
+            (1, 130, 2, 32, 32, (4,), 0.05, torch.bfloat16),
         ]
     ],
 )
-def test_fuse_key_factors(B: int, T: int, H: int, K: int, V: int, factors: tuple[int, ...], dtype: torch.dtype):
+def test_fuse_key_factors(
+    B: int,
+    T: int,
+    H: int,
+    K: int,
+    V: int,
+    factors: tuple[int, ...],
+    gate_scale: float,
+    dtype: torch.dtype,
+):
     # an n-way state with key factors k_1 ⊗ ... ⊗ k_m ⊗ k runs on chunk_triadic_gdn through fuse_key_factors
     torch.manual_seed(42)
     m, E = len(factors), math.prod(factors)
     q, k, v, _, _, _, beta = _make_inputs(B, T, H, K, V, 1, 1, dtype)
-    k2s, q2s, gs = _make_factors(B, T, H, factors)
+    k2s, q2s, gs = _make_factors(B, T, H, factors, gate_scale)
     h0 = torch.randn(B, H, *factors, K, V, dtype=torch.float32, device=device)
     inputs = [x.requires_grad_(True) for x in [q, k, v, beta, h0, *k2s, *q2s, *gs]]
     do = torch.randn_like(v)
     dht = torch.randn_like(h0)
     scale = K ** -0.5
 
-    ref, ref_ht = _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, h0)
+    ref, ref_ht = _naive_nway(q=q, k=k, v=v, k2s=k2s, q2s=q2s, gs=gs, beta=beta, scale=scale, initial_state=h0)
     ((ref * do.double()).sum() + (ref_ht * dht.double()).sum()).backward()
     ref_grads = [x.grad for x in inputs]
     for x in inputs:
@@ -359,7 +368,7 @@ def test_fuse_key_factors_triadic_kda(B: int, T: int, H: int, K: int, V: int, fa
     h0 = torch.randn(B, H, *factors, K, V, dtype=torch.float32, device=device)
     scale = K ** -0.5
 
-    ref, ref_ht = _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, h0, gk=gk)
+    ref, ref_ht = _naive_nway(q=q, k=k, v=v, k2s=k2s, q2s=q2s, gs=gs, beta=beta, scale=scale, initial_state=h0, gk=gk)
     k2, q2, g2 = fuse_key_factors(k2s, q2s, gs)
     tri, tri_ht = naive_recurrent_triadic_kda(
         q=q,
@@ -379,6 +388,7 @@ def test_fuse_key_factors_triadic_kda(B: int, T: int, H: int, K: int, V: int, fa
 
 
 def test_fuse_key_factors_shapes():
+    torch.manual_seed(42)
     x = torch.rand(2, 8, 2, 3)
     with pytest.raises(ValueError, match='number of factors'):
         fuse_key_factors([x, x], [x], [x, x])
