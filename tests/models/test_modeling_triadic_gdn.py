@@ -149,10 +149,15 @@ def test_state_shape():
     assert layer.A_log.shape == layer.dt_bias.shape == (2 * 5,)
     assert TriadicGatedDeltaNet(hidden_size=64, head_dim=16, num_heads=2, key_factors=4).key_factors == (4,)
     assert TriadicGatedDeltaNetConfig(key_factors=4).key_factors == [4]
+    assert layer.o_norm.activation == 'sigmoid'
+    swish = TriadicGatedDeltaNet(hidden_size=64, head_dim=16, num_heads=2, output_gate_activation='swish')
+    assert swish.o_norm.activation == 'swish'
     with pytest.raises(ValueError, match='key_factors'):
         TriadicGatedDeltaNet(hidden_size=64, head_dim=16, num_heads=2, key_factors=(2, 0))
     with pytest.raises(ValueError, match='key_factors'):
         TriadicGatedDeltaNetConfig(key_factors=[])
+    with pytest.raises(ValueError, match='output_gate_activation'):
+        TriadicGatedDeltaNet(hidden_size=64, head_dim=16, num_heads=2, output_gate_activation='relu')
     with pytest.raises(ValueError, match='output_gate_activation'):
         TriadicGatedDeltaNetConfig(output_gate_activation='relu')
 
