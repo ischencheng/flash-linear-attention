@@ -125,12 +125,14 @@ class TriadicGatedDeltaNet(nn.Module):
             q2, _ = self.q2_conv1d(q2)
         else:
             q, k, v = F.silu(q), F.silu(k), F.silu(v)
-        q = F.normalize(rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim).float(), dim=-1).to(x.dtype)
-        k = F.normalize(rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim).float(), dim=-1).to(x.dtype)
+        # the chunk kernels take q, k, v, k2 and q2 in one dtype, the gates and beta in fp32
+        dtype = v.dtype
+        q = F.normalize(rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim).float(), dim=-1).to(dtype)
+        k = F.normalize(rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim).float(), dim=-1).to(dtype)
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
 
-        k2s = [F.normalize(F.softplus(t.float()), dim=-1).to(x.dtype) for t in self._factors(k2)]
-        q2s = [F.normalize(F.softplus(t.float()), dim=-1).to(x.dtype) for t in self._factors(q2)]
+        k2s = [F.normalize(F.softplus(t.float()), dim=-1).to(dtype) for t in self._factors(k2)]
+        q2s = [F.normalize(F.softplus(t.float()), dim=-1).to(dtype) for t in self._factors(q2)]
         g2 = -self.A2_log.float().exp() * F.softplus(self.a2_proj(x).float() + self.dt2_bias)
         k2, q2, g2 = fuse_key_factors(k2s, q2s, self._factors(g2))
         beta = self.b_proj(x).float().sigmoid()
