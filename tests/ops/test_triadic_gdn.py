@@ -18,6 +18,7 @@ from fla.ops.triadic_gdn import (
     naive_chunk_triadic_gdn,
     naive_recurrent_triadic_gdn,
 )
+from fla.ops.triadic_kda import naive_recurrent_triadic_kda
 from fla.utils import assert_close, device
 
 
@@ -250,27 +251,36 @@ def test_chunk_varlen(H: int, K: int, V: int, E: int, cu_seqlens: list[int], dty
         assert_close(name, ref_grad, tri_grad, ratio)
 
 
-def _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, initial_state):
-    # explicit n-way state S[b, h, e_1, ..., e_m, c, v]; independent of the flattened triadic layout
+def _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, initial_state, gk=None):
+    # explicit n-way state S[b, h, e_1, ..., e_m, c, v] in FP64, independent of the flattened triadic layout
+    q, k, v, beta, S = (x.double() for x in (q, k, v, beta, initial_state))
+    k2s, q2s, gs = ([x.double() for x in xs] for xs in (k2s, q2s, gs))
     B, T, H, K = q.shape
     m = len(k2s)
     letters = 'stuvwxyz'[:m]
-
-    def outer(xs):
-        return torch.einsum(','.join(f'bh{c}' for c in letters) + ',bhk->bh' + letters + 'k', *xs)
-
-    S = initial_state.clone()
-    o = torch.zeros_like(v)
+    equation = ','.join(f'bh{c}' for c in letters) + ',bhk->bh' + letters + 'k'
     dims = tuple(range(2, 3 + m))
+    o = torch.zeros_like(v)
     for t in range(T):
-        kappa = outer([x[:, t] for x in k2s] + [k[:, t]])
-        rho = outer([x[:, t] for x in q2s] + [q[:, t]])
-        decay = sum(g[:, t].reshape(B, H, *[g.shape[-1] if j == a else 1 for j in range(m)]) for a, g in enumerate(gs))
-        S = S * decay.exp()[..., None, None]
+        kappa = torch.einsum(equation, *[x[:, t] for x in k2s], k[:, t])
+        rho = torch.einsum(equation, *[x[:, t] for x in q2s], q[:, t])
+        decay = torch.zeros(B, H, *[g.shape[-1] for g in gs], K, dtype=torch.float64, device=q.device)
+        for a, g in enumerate(gs):
+            decay = decay + g[:, t].reshape(B, H, *[g.shape[-1] if j == a else 1 for j in range(m)], 1)
+        if gk is not None:
+            decay = decay + gk[:, t].double().reshape(B, H, *[1] * m, K)
+        S = S * decay.exp()[..., None]
         u = beta[:, t, :, None] * (v[:, t] - (kappa[..., None] * S).sum(dims))
         S = S + kappa[..., None] * u.reshape(B, H, *[1] * (m + 1), -1)
         o[:, t] = scale * (rho[..., None] * S).sum(dims)
     return o, S
+
+
+def _make_factors(B, T, H, factors):
+    k2s = [F.normalize(F.softplus(torch.randn(B, T, H, e, device=device)), p=2, dim=-1) for e in factors]
+    q2s = [F.normalize(F.softplus(torch.randn(B, T, H, e, device=device)), p=2, dim=-1) for e in factors]
+    gs = [F.logsigmoid(torch.rand(B, T, H, e, device=device)) for e in factors]
+    return k2s, q2s, gs
 
 
 @pytest.mark.parametrize(
@@ -282,26 +292,24 @@ def _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, initial_state):
             (1, 300, 2, 64, 64, (2, 3), torch.bfloat16),
             (2, 200, 2, 64, 32, (2, 2, 2), torch.float16),
             (1, 150, 2, 32, 32, (3, 2, 2), torch.bfloat16),
+            (1, 130, 2, 32, 32, (4,), torch.bfloat16),
         ]
     ],
 )
 def test_fuse_key_factors(B: int, T: int, H: int, K: int, V: int, factors: tuple[int, ...], dtype: torch.dtype):
     # an n-way state with key factors k_1 ⊗ ... ⊗ k_m ⊗ k runs on chunk_triadic_gdn through fuse_key_factors
     torch.manual_seed(42)
-    E = math.prod(factors)
+    m, E = len(factors), math.prod(factors)
     q, k, v, _, _, _, beta = _make_inputs(B, T, H, K, V, 1, 1, dtype)
-    k2s = [F.normalize(F.softplus(torch.randn(B, T, H, e, device=device)), p=2, dim=-1) for e in factors]
-    q2s = [F.normalize(F.softplus(torch.randn(B, T, H, e, device=device)), p=2, dim=-1) for e in factors]
-    gs = [F.logsigmoid(torch.rand(B, T, H, e, device=device)) for e in factors]
+    k2s, q2s, gs = _make_factors(B, T, H, factors)
     h0 = torch.randn(B, H, *factors, K, V, dtype=torch.float32, device=device)
     inputs = [x.requires_grad_(True) for x in [q, k, v, beta, h0, *k2s, *q2s, *gs]]
     do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
     scale = K ** -0.5
 
-    ref, ref_ht = _naive_nway(
-        *[x.float() for x in (q, k, v)], k2s, q2s, gs, beta, scale, h0,
-    )
-    ((ref * do.float()).sum() + ref_ht.sum()).backward()
+    ref, ref_ht = _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, h0)
+    ((ref * do.double()).sum() + (ref_ht * dht.double()).sum()).backward()
     ref_grads = [x.grad for x in inputs]
     for x in inputs:
         x.grad = None
@@ -309,16 +317,72 @@ def test_fuse_key_factors(B: int, T: int, H: int, K: int, V: int, factors: tuple
     k2, q2, g = fuse_key_factors(k2s, q2s, gs)
     assert k2.shape == q2.shape == g.shape == (B, T, H, E)
     tri, tri_ht = chunk_triadic_gdn(
-        q=q, k=k, v=v, k2=k2, q2=q2, g=g, beta=beta, scale=scale,
-        initial_state=h0.flatten(2, 1 + len(factors)), output_final_state=True,
+        q=q,
+        k=k,
+        v=v,
+        k2=k2,
+        q2=q2,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=h0.flatten(2, 1 + m),
+        output_final_state=True,
     )
-    ((tri * do).sum() + tri_ht.sum()).backward()
+    ((tri * do).sum() + (tri_ht * dht.flatten(2, 1 + m)).sum()).backward()
     tri_grads = [x.grad for x in inputs]
 
     assert_close('o', ref, tri, 0.005)
     assert_close('ht', ref_ht, tri_ht.view_as(ref_ht), 0.005)
-    m = len(factors)
-    names = ['dq', 'dk', 'dv', 'db', 'dh0'] + [f'dk2_{a}' for a in range(m)] + [f'dq2_{a}' for a in range(m)] + \
-        [f'dg_{a}' for a in range(m)]
-    for name, ref_grad, tri_grad in zip(names, ref_grads, tri_grads):
+    names = ['dq', 'dk', 'dv', 'db', 'dh0']
+    names += [f'{name}_{a}' for name in ('dk2', 'dq2', 'dg') for a in range(m)]
+    for name, ref_grad, tri_grad in zip(names, ref_grads, tri_grads, strict=True):
         assert_close(name, ref_grad, tri_grad, 0.02 if name.startswith(('dg', 'db')) else 0.008)
+
+
+@pytest.mark.parametrize(
+    ('B', 'T', 'H', 'K', 'V', 'factors'),
+    [
+        pytest.param(*test, id="B{}-T{}-H{}-K{}-V{}-factors{}".format(*test))
+        for test in [
+            (2, 64, 2, 16, 16, (2, 2)),
+            (1, 50, 2, 16, 32, (2, 3, 2)),
+        ]
+    ],
+)
+def test_fuse_key_factors_triadic_kda(B: int, T: int, H: int, K: int, V: int, factors: tuple[int, ...]):
+    # with a per-channel decay gk the fused factors are the inputs of the Triadic KDA reference
+    torch.manual_seed(42)
+    m = len(factors)
+    q, k, v, _, _, _, beta = _make_inputs(B, T, H, K, V, 1, 1, torch.float32)
+    k2s, q2s, gs = _make_factors(B, T, H, factors)
+    gk = F.logsigmoid(torch.rand(B, T, H, K, device=device))
+    h0 = torch.randn(B, H, *factors, K, V, dtype=torch.float32, device=device)
+    scale = K ** -0.5
+
+    ref, ref_ht = _naive_nway(q, k, v, k2s, q2s, gs, beta, scale, h0, gk=gk)
+    k2, q2, g2 = fuse_key_factors(k2s, q2s, gs)
+    tri, tri_ht = naive_recurrent_triadic_kda(
+        q=q,
+        k=k,
+        v=v.double(),
+        k2=k2,
+        q2=q2,
+        gk=gk,
+        g2=g2,
+        beta=beta,
+        scale=scale,
+        initial_state=h0.flatten(2, 1 + m),
+        output_final_state=True,
+    )
+    assert_close('o', ref, tri, 1e-5)
+    assert_close('ht', ref_ht.float(), tri_ht.view(ref_ht.shape), 1e-5)
+
+
+def test_fuse_key_factors_shapes():
+    x = torch.rand(2, 8, 2, 3)
+    with pytest.raises(ValueError, match='number of factors'):
+        fuse_key_factors([x, x], [x], [x, x])
+    with pytest.raises(ValueError, match='shapes differ'):
+        fuse_key_factors([x], [x], [x[..., :2]])
+    with pytest.raises(ValueError, match='leading dims'):
+        fuse_key_factors([x, x[:1]], [x, x[:1]], [x, x[:1]])
