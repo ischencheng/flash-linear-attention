@@ -8,32 +8,56 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from einops import rearrange
 from torch.nn import functional as F
 
+from fla.layers.utils import get_layer_cache, repad_hidden_states, unpad_hidden_states, update_layer_cache
 from fla.modules import FusedRMSNormGated, ShortConvolution
-from fla.ops.triadic_gdn import chunk_triadic_gdn
-from fla.ops.triadic_gdn.factors import fuse_key_factors
+from fla.ops.triadic_gdn import chunk_triadic_gdn, fuse_key_factors
 
+if TYPE_CHECKING:
+    from transformers.processing_utils import Unpack
 
-def _inv_softplus_dt(n: int) -> torch.Tensor:
-    dt = torch.exp(torch.rand(n) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
-    return dt + torch.log(-torch.expm1(-dt))
+    from fla.models.cache_utils import Cache
 
 
 class TriadicGatedDeltaNet(nn.Module):
     """
     Triadic Gated DeltaNet layer (https://arxiv.org/abs/2609.36529), with an n-way state.
 
-    `key_factors=(E,)` is Triadic GDN with `E` slices, `key_factors=(E_1, ..., E_m)` keeps an n-way state
-    `[E_1, ..., E_m, K, V]` per head written with the joint key `k_1 ⊗ ... ⊗ k_m ⊗ k`, and `key_factors=(1,)` is GDN.
-    Each factor has its own short conv, softplus + L2 norm and gate `-exp(A_a) * softplus(W_a x + b_a)`.
-    With `channel_decay=True`, a KDA-style gate per key channel is added (Triadic KDA).
+    Each head keeps a state of shape `[E_1, ..., E_m, K, V]` for `key_factors=(E_1, ..., E_m)`, written with the
+    joint key `k_1 ⊗ ... ⊗ k_m ⊗ k`. `key_factors=(E,)` is Triadic GDN with `E` slices.
+    Each factor has its own short conv, softplus + L2 norm and gate `-exp(A_a) * softplus(W_a x + b_a)`,
+    so the second key, query and gate projections have `E_1 + ... + E_m` outputs per head.
+    The cached recurrent state is stored flattened as `[N, H, E_1 * ... * E_m, K, V]`.
 
-    Training and full-sequence forward only (no cache).
+    Args:
+        hidden_size (int, Optional):
+            The hidden size of the input. Default: 2048.
+        head_dim (int, Optional):
+            The dimension of each head. Default: 128.
+        num_heads (int, Optional):
+            The number of heads. Default: 16.
+        expand_v (float, Optional):
+            The expansion ratio for the value dimension. Default: 1.0.
+        key_factors (tuple[int, ...], Optional):
+            The sizes `E_1, ..., E_m` of the second key factors. Default: `(4,)`.
+        mode (str, Optional):
+            Which kernel to use. Currently only `chunk` is supported. Default: `chunk`.
+        use_short_conv (bool, Optional):
+            Whether to use short convolutions. Default: `True`.
+        conv_size (int, Optional):
+            The kernel size of the short convolution. Default: 4.
+        conv_bias (bool, Optional):
+            Whether to use bias in the short convolution. Default: `False`.
+        norm_eps (float, Optional):
+            The epsilon value for the output normalization layer. Default: 1e-5.
+        layer_idx (int, Optional):
+            The index of the layer. Default: None.
     """
 
     def __init__(
@@ -43,61 +67,67 @@ class TriadicGatedDeltaNet(nn.Module):
         num_heads: int = 16,
         expand_v: float = 1.0,
         key_factors: tuple[int, ...] = (4,),
-        channel_decay: bool = False,
+        mode: str = 'chunk',
         use_short_conv: bool = True,
         conv_size: int = 4,
+        conv_bias: bool = False,
         norm_eps: float = 1e-5,
         layer_idx: int | None = None,
         **kwargs,
     ) -> TriadicGatedDeltaNet:
         super().__init__()
+        if mode != 'chunk':
+            raise NotImplementedError(f"Not supported mode `{mode}`.")
+        key_factors = tuple(int(e) for e in key_factors)
+        if len(key_factors) == 0 or min(key_factors) < 1:
+            raise ValueError(f"key_factors must be a non-empty tuple of positive sizes, got {key_factors}.")
+
+        self.mode = mode
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_k_dim = head_dim
         self.head_v_dim = int(head_dim * expand_v)
         self.key_dim = num_heads * self.head_k_dim
         self.value_dim = num_heads * self.head_v_dim
-        self.key_factors = tuple(int(e) for e in key_factors)
-        self.sum_e = sum(self.key_factors)
-        self.channel_decay = channel_decay
+        self.key_factors = key_factors
+        self.num_slices = math.prod(key_factors)
         self.use_short_conv = use_short_conv
+        self.conv_size = conv_size
+        self.conv_bias = conv_bias
         self.layer_idx = layer_idx
 
+        factor_dim = num_heads * sum(key_factors)
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.k2_proj = nn.Linear(hidden_size, num_heads * self.sum_e, bias=False)
-        self.q2_proj = nn.Linear(hidden_size, num_heads * self.sum_e, bias=False)
-        self.a2_proj = nn.Linear(hidden_size, num_heads * self.sum_e, bias=False)
+        self.k2_proj = nn.Linear(hidden_size, factor_dim, bias=False)
+        self.q2_proj = nn.Linear(hidden_size, factor_dim, bias=False)
+        self.a2_proj = nn.Linear(hidden_size, factor_dim, bias=False)
         self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
 
-        self.A2_log = nn.Parameter(torch.empty(num_heads * self.sum_e).uniform_(0, 16).log())
-        self.A2_log._no_weight_decay = True
-        self.dt2_bias = nn.Parameter(_inv_softplus_dt(num_heads * self.sum_e))
-        self.dt2_bias._no_weight_decay = True
-
-        if channel_decay:
-            self.f_proj = nn.Sequential(
-                nn.Linear(hidden_size, self.head_v_dim, bias=False),
-                nn.Linear(self.head_v_dim, self.key_dim, bias=False),
-            )
-            self.A_log = nn.Parameter(torch.empty(num_heads).uniform_(1, 16).log())
-            self.A_log._no_weight_decay = True
-            self.dt_bias = nn.Parameter(_inv_softplus_dt(self.key_dim))
-            self.dt_bias._no_weight_decay = True
+        A = torch.empty(factor_dim, dtype=torch.float32).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+        # hard coded for now
+        dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+        dt = torch.exp(torch.rand(factor_dim) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+        dt = torch.clamp(dt, min=dt_init_floor)
+        # inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        self.dt_bias._no_weight_decay = True
 
         if use_short_conv:
-            self.q_conv1d = ShortConvolution(hidden_size=self.key_dim, kernel_size=conv_size, activation='silu')
-            self.k_conv1d = ShortConvolution(hidden_size=self.key_dim, kernel_size=conv_size, activation='silu')
-            self.v_conv1d = ShortConvolution(hidden_size=self.value_dim, kernel_size=conv_size, activation='silu')
-            self.k2_conv1d = ShortConvolution(hidden_size=num_heads * self.sum_e, kernel_size=conv_size, activation=None)
-            self.q2_conv1d = ShortConvolution(hidden_size=num_heads * self.sum_e, kernel_size=conv_size, activation=None)
+            self.q_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
+            self.k_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
+            self.v_conv1d = ShortConvolution(self.value_dim, conv_size, bias=conv_bias, activation='silu')
+            self.k2_conv1d = ShortConvolution(factor_dim, conv_size, bias=conv_bias, activation=None)
+            self.q2_conv1d = ShortConvolution(factor_dim, conv_size, bias=conv_bias, activation=None)
 
         self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.o_norm = FusedRMSNormGated(hidden_size=self.head_v_dim, eps=norm_eps, activation='sigmoid')
+        self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=norm_eps, activation='sigmoid')
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
-    def _factors(self, x: torch.Tensor) -> list[torch.Tensor]:
+    def _split_factors(self, x: torch.Tensor) -> list[torch.Tensor]:
         x = rearrange(x, '... (h e) -> ... h e', h=self.num_heads)
         return list(torch.split(x, self.key_factors, dim=-1))
 
@@ -105,46 +135,78 @@ class TriadicGatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        past_key_values=None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         output_attentions: bool | None = False,
-        **kwargs,
-    ):
-        if use_cache or past_key_values is not None:
-            raise NotImplementedError("TriadicGatedDeltaNet runs full sequences only.")
-        if attention_mask is not None and not bool(attention_mask.all()):
-            raise NotImplementedError("TriadicGatedDeltaNet does not take padding masks.")
-        x = hidden_states
-        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        k2, q2 = self.k2_proj(x), self.q2_proj(x)
+        **kwargs: Unpack[dict],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        if attention_mask is not None:
+            assert len(attention_mask.shape) == 2, (
+                "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
+                "for padding purposes (0 indicating padding). "
+                "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
+            )
+
+        batch_size, q_len, _ = hidden_states.shape
+        last_state = get_layer_cache(module=self, past_key_values=past_key_values)
+
+        cu_seqlens = kwargs.get('cu_seqlens')
+        hidden_states, indices, cu_seqlens = unpad_hidden_states(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            attention_mask=attention_mask,
+            q_len=q_len,
+        )
+
+        q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        k2, q2 = self.k2_proj(hidden_states), self.q2_proj(hidden_states)
+        conv_state = None
         if self.use_short_conv:
-            q, _ = self.q_conv1d(q)
-            k, _ = self.k_conv1d(k)
-            v, _ = self.v_conv1d(v)
-            k2, _ = self.k2_conv1d(k2)
-            q2, _ = self.q2_conv1d(q2)
+            conv_state = last_state['conv_state'] if last_state is not None else (None,) * 5
+            convs = (self.q_conv1d, self.k_conv1d, self.v_conv1d, self.k2_conv1d, self.q2_conv1d)
+            outputs = [
+                conv(x=x, cache=cache, output_final_state=use_cache, cu_seqlens=cu_seqlens)
+                for conv, x, cache in zip(convs, (q, k, v, k2, q2), conv_state)
+            ]
+            (q, k, v, k2, q2), conv_state = zip(*outputs)
         else:
             q, k, v = F.silu(q), F.silu(k), F.silu(v)
-        # the chunk kernels take q, k, v, k2 and q2 in one dtype, the gates and beta in fp32
+
+        # the chunk kernel takes q, k, v, k2 and q2 in one dtype, the gates and beta in fp32
         dtype = v.dtype
         q = F.normalize(rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim).float(), dim=-1).to(dtype)
         k = F.normalize(rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim).float(), dim=-1).to(dtype)
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+        k2s = [F.normalize(F.softplus(x.float()), dim=-1).to(dtype) for x in self._split_factors(k2)]
+        q2s = [F.normalize(F.softplus(x.float()), dim=-1).to(dtype) for x in self._split_factors(q2)]
+        g = -self.A_log.float().exp() * F.softplus(self.a2_proj(hidden_states).float() + self.dt_bias)
+        k2, q2, g = fuse_key_factors(k2s, q2s, self._split_factors(g))
+        beta = self.b_proj(hidden_states).float().sigmoid()
 
-        k2s = [F.normalize(F.softplus(t.float()), dim=-1).to(dtype) for t in self._factors(k2)]
-        q2s = [F.normalize(F.softplus(t.float()), dim=-1).to(dtype) for t in self._factors(q2)]
-        g2 = -self.A2_log.float().exp() * F.softplus(self.a2_proj(x).float() + self.dt2_bias)
-        k2, q2, g2 = fuse_key_factors(k2s, q2s, self._factors(g2))
-        beta = self.b_proj(x).float().sigmoid()
+        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
+        o, recurrent_state = chunk_triadic_gdn(
+            q=q,
+            k=k,
+            v=v,
+            k2=k2,
+            q2=q2,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=use_cache,
+            cu_seqlens=cu_seqlens,
+        )
 
-        if self.channel_decay:
-            from fla.ops.triadic_kda import chunk_triadic_kda
-            gk = F.softplus(self.f_proj(x).float() + self.dt_bias)
-            gk = -self.A_log.float().exp()[:, None] * rearrange(gk, '... (h d) -> ... h d', d=self.head_k_dim)
-            o, _ = chunk_triadic_kda(q=q, k=k, v=v, k2=k2, q2=q2, gk=gk, g2=g2, beta=beta)
-        else:
-            o, _ = chunk_triadic_gdn(q=q, k=k, v=v, k2=k2, q2=q2, g=g2, beta=beta)
+        update_layer_cache(
+            module=self,
+            past_key_values=past_key_values,
+            recurrent_state=recurrent_state,
+            conv_state=conv_state,
+            offset=q_len,
+        )
 
-        o = self.o_norm(o, rearrange(self.g_proj(x), '... (h d) -> ... h d', d=self.head_v_dim))
+        o = self.o_norm(o, rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim))
         o = self.o_proj(rearrange(o, 'b t h d -> b t (h d)'))
+        o = repad_hidden_states(hidden_states=o, indices=indices, batch_size=batch_size, q_len=q_len)
+
         return o, None, past_key_values
