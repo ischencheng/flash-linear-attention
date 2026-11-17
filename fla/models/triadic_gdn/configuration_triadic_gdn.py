@@ -19,7 +19,7 @@ class TriadicGatedDeltaNetConfig(AttentionConfigBase, PreTrainedConfig):
         attn_mode: str = "chunk",
         hidden_size: int = 2048,
         expand_v: float = 1.0,
-        key_factors: list[int] | tuple[int, ...] = (4,),
+        key_factors: int | list[int] | tuple[int, ...] = (4,),
         use_short_conv: bool = True,
         conv_size: int = 4,
         head_dim: int = 128,
@@ -43,13 +43,14 @@ class TriadicGatedDeltaNetConfig(AttentionConfigBase, PreTrainedConfig):
         fuse_linear_cross_entropy: bool = False,
         use_l2warp: bool = False,
         vocab_size: int = 32000,
+        output_gate_activation: str = "sigmoid",
         **kwargs,
     ):
         self.attn_mode = attn_mode
         self.hidden_size = hidden_size
         self.expand_v = expand_v
         # stored as a list so that the config round-trips through JSON unchanged
-        self.key_factors = [int(e) for e in key_factors]
+        self.key_factors = [key_factors] if isinstance(key_factors, int) else [int(e) for e in key_factors]
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.head_dim = head_dim
@@ -71,9 +72,12 @@ class TriadicGatedDeltaNetConfig(AttentionConfigBase, PreTrainedConfig):
         self.fuse_linear_cross_entropy = fuse_linear_cross_entropy
         self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
+        self.output_gate_activation = output_gate_activation
 
         if len(self.key_factors) == 0 or min(self.key_factors) < 1:
             raise ValueError(f"key_factors must be a non-empty list of positive sizes, got {key_factors}.")
+        if output_gate_activation not in ("swish", "silu", "sigmoid"):
+            raise ValueError(f"output_gate_activation must be 'swish', 'silu', or 'sigmoid', got {output_gate_activation!r}.")
         validate_loss_config(fuse_cross_entropy=fuse_cross_entropy, fuse_linear_cross_entropy=fuse_linear_cross_entropy)
 
         super().__init__(

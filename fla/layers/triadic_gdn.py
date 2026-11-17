@@ -34,6 +34,7 @@ class TriadicGatedDeltaNet(nn.Module):
     Each factor has its own short conv, softplus + L2 norm and gate `-exp(A_a) * softplus(W_a x + b_a)`,
     so the second key, query and gate projections have `E_1 + ... + E_m` outputs per head.
     The cached recurrent state is stored flattened as `[N, H, E_1 * ... * E_m, K, V]`.
+    The chunk kernel keeps the `E_1 * ... * E_m` slices of a state block in registers and is tested with up to 16 slices.
 
     Args:
         hidden_size (int, Optional):
@@ -44,8 +45,8 @@ class TriadicGatedDeltaNet(nn.Module):
             The number of heads. Default: 16.
         expand_v (float, Optional):
             The expansion ratio for the value dimension. Default: 1.0.
-        key_factors (tuple[int, ...], Optional):
-            The sizes `E_1, ..., E_m` of the second key factors. Default: `(4,)`.
+        key_factors (int | tuple[int, ...], Optional):
+            The sizes `E_1, ..., E_m` of the second key factors. An int `E` means `(E,)`. Default: `(4,)`.
         mode (str, Optional):
             Which kernel to use. Currently only `chunk` is supported. Default: `chunk`.
         use_short_conv (bool, Optional):
@@ -56,6 +57,8 @@ class TriadicGatedDeltaNet(nn.Module):
             Whether to use bias in the short convolution. Default: `False`.
         norm_eps (float, Optional):
             The epsilon value for the output normalization layer. Default: 1e-5.
+        output_gate_activation (str, Optional):
+            The activation of the output gate, one of `swish`, `silu` and `sigmoid`. Default: `sigmoid`.
         layer_idx (int, Optional):
             The index of the layer. Default: None.
     """
@@ -66,21 +69,24 @@ class TriadicGatedDeltaNet(nn.Module):
         head_dim: int = 128,
         num_heads: int = 16,
         expand_v: float = 1.0,
-        key_factors: tuple[int, ...] = (4,),
+        key_factors: int | tuple[int, ...] = (4,),
         mode: str = 'chunk',
         use_short_conv: bool = True,
         conv_size: int = 4,
         conv_bias: bool = False,
         norm_eps: float = 1e-5,
+        output_gate_activation: str = 'sigmoid',
         layer_idx: int | None = None,
         **kwargs,
     ) -> TriadicGatedDeltaNet:
         super().__init__()
         if mode != 'chunk':
             raise NotImplementedError(f"Not supported mode `{mode}`.")
-        key_factors = tuple(int(e) for e in key_factors)
+        key_factors = (key_factors,) if isinstance(key_factors, int) else tuple(int(e) for e in key_factors)
         if len(key_factors) == 0 or min(key_factors) < 1:
             raise ValueError(f"key_factors must be a non-empty tuple of positive sizes, got {key_factors}.")
+        if output_gate_activation not in ('swish', 'silu', 'sigmoid'):
+            raise ValueError(f"output_gate_activation must be 'swish', 'silu', or 'sigmoid', got {output_gate_activation!r}.")
 
         self.mode = mode
         self.hidden_size = hidden_size
@@ -124,7 +130,7 @@ class TriadicGatedDeltaNet(nn.Module):
             self.q2_conv1d = ShortConvolution(factor_dim, conv_size, bias=conv_bias, activation=None)
 
         self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=norm_eps, activation='sigmoid')
+        self.o_norm = FusedRMSNormGated(self.head_v_dim, eps=norm_eps, activation=output_gate_activation)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
     def _split_factors(self, x: torch.Tensor) -> list[torch.Tensor]:

@@ -52,6 +52,7 @@ class TriadicGatedDeltaNetBlock(GradientCheckpointingLayer):
                 use_short_conv=config.use_short_conv,
                 conv_size=config.conv_size,
                 norm_eps=config.norm_eps,
+                output_gate_activation=config.output_gate_activation,
                 layer_idx=layer_idx,
             )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
