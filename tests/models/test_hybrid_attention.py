@@ -41,6 +41,7 @@ from fla.models import (
     RWKV6Config,
     RWKV7Config,
     SambaConfig,
+    TriadicGatedDeltaNetConfig,
 )
 from fla.models.configuration_utils import get_attention_spec, parse_attention_config
 from fla.models.gated_deltanet.modeling_gated_deltanet import GatedDeltaNetBlock
@@ -73,6 +74,7 @@ CONFIG_CLASSES = (
     RWKV6Config,
     RWKV7Config,
     SambaConfig,
+    TriadicGatedDeltaNetConfig,
 )
 
 SAMBA_CANONICAL_ATTN = {
